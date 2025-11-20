@@ -2,8 +2,8 @@ import json
 import re
 from pathlib import Path
 from typing import List, Set
-from urllib.parse import urlparse, parse_qs, unquote
 
+import requests
 from playwright.sync_api import sync_playwright, Page
 
 # 設定ファイル
@@ -25,12 +25,12 @@ OREVIDEO_URL = "https://orevideo.pythonanywhere.com/"
 
 
 def load_sources() -> List[str]:
-    """スクレイピング対象の Nitter URL を config/sources.json から読み込み"""
+    """スクレイピング対象の RSS URL を config/sources.json から読み込み"""
     if not SOURCES_FILE.exists():
-        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。NitterのURLをここに保存してください。")
+        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。RSSのURLをここに保存してください。")
     with SOURCES_FILE.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    # 形式: { "sources": ["https://nitter.net/...", ...] }
+    # 形式: { "sources": ["https://...rss...", ...] }
     return data.get("sources", [])
 
 
@@ -56,70 +56,22 @@ def save_seen_urls(seen: Set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
-def extract_gofile_from_href(href: str) -> str | None:
+def collect_gofile_urls_from_rss(rss_url: str) -> Set[str]:
     """
-    href から gofile.io/d/... の実URLを取り出す。
-    - 直接 https://gofile.io/d/XXX の場合
-    - /external?url=https%3A%2F%2Fgofile.io%2Fd%2FXXX のような場合
+    RSSフィードを取得して、中に含まれる gofile.io/d/... URL を全部抜き出す
+    （XMLの中身をそのままテキストとして正規表現で舐める）
     """
-    if not href:
-        return None
-
-    # ケース1: そのまま gofile.io/d/xxx が入っている
-    m = GOFILE_REGEX.search(href)
-    if m:
-        return m.group(0)
-
-    # ケース2: ?url= にエンコードされているパターン
+    print(f"  Fetching RSS: {rss_url}")
     try:
-        parsed = urlparse(href)
-        qs = parse_qs(parsed.query)
-        if "url" in qs:
-            for v in qs["url"]:
-                decoded = unquote(v)
-                m2 = GOFILE_REGEX.search(decoded)
-                if m2:
-                    return m2.group(0)
-    except Exception:
-        pass
+        resp = requests.get(rss_url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  Failed to fetch RSS: {e}")
+        return set()
 
-    return None
-
-
-def scroll_and_collect_gofile_urls(page: Page) -> Set[str]:
-    """
-    Nitterページで 'Load more' を押しつつ、gofile.io/d/... URL をすべて収集。
-    HTMLを正規表現で舐めるのではなく、aタグのhrefを全部見る。
-    """
-    urls: Set[str] = set()
-
-    while True:
-        link_locators = page.locator("a")
-        count = link_locators.count()
-        print(f"    Scanning {count} links on this page...")
-        for i in range(count):
-            try:
-                href = link_locators.nth(i).get_attribute("href")
-            except Exception:
-                continue
-            gofile_url = extract_gofile_from_href(href or "")
-            if gofile_url:
-                urls.add(gofile_url)
-
-        # Load more ボタンを探す
-        load_more = page.locator("div.show-more a:has-text('Load more')")
-        if load_more.count() == 0:
-            break
-
-        try:
-            print("    Clicking 'Load more'...")
-            load_more.first.click()
-            # 読み込み待ち（適宜調整）
-            page.wait_for_timeout(2000)
-        except Exception:
-            print("    Failed to click 'Load more' or no more pages.")
-            break
-
+    text = resp.text
+    urls = set(GOFILE_REGEX.findall(text))
+    print(f"  Found {len(urls)} gofile URLs in RSS")
     return urls
 
 
@@ -171,7 +123,7 @@ def main():
         # headless Chromium を起動
         browser = p.chromium.launch(headless=True)
 
-        # 👉 User-Agent を普通のChromeブラウザっぽく偽装
+        # UA は一応それっぽいのを入れておく（gofile / orevideo用）
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -181,45 +133,26 @@ def main():
             viewport={"width": 1280, "height": 720},
         )
 
-        # Nitterスクレイピング用ページ
-        nitter_page = context.new_page()
         # gofile確認 & orevideoアップロード用ページ
         gofile_page = context.new_page()
-        ore_page = gofile_page  # 同じタブを使い回す
+        ore_page = context.new_page()
 
         new_seen = False
 
         for src in sources:
-            print(f"Scraping source: {src}")
-            try:
-                nitter_page.goto(src, wait_until="networkidle", timeout=30000)
-            except Exception as e:
-                print(f"  Failed to open {src}: {e}")
-                continue
+            print(f"Scraping RSS source: {src}")
+            urls = collect_gofile_urls_from_rss(src)
 
-            # 最終URLとHTMLの一部をデバッグ出力
-            print(f"  Final URL: {nitter_page.url}")
-            nitter_page.wait_for_timeout(2000)
-
-            try:
-                html = nitter_page.content()
-                snippet = html[:600].replace("\n", " ")
-                print(f"  Page HTML snippet: {snippet}")
-            except Exception as e:
-                print(f"  Failed to get page content: {e}")
-
-            urls = scroll_and_collect_gofile_urls(nitter_page)
-            print(f"  Found {len(urls)} gofile URLs")
-
-            for url in sorted(urls):  # 一応ソート（安定性のため）
+            for url in sorted(urls):
                 if url in seen_urls:
                     # すでに処理済み
+                    # print(f"  Already seen: {url}")
                     continue
 
                 print(f"  Checking gofile URL: {url}")
                 if not is_gofile_alive(gofile_page, url):
                     print("    -> Dead or password protected. Skipped.")
-                    # 死んでいるものも再チェック不要ならここで追加
+                    # 死んでいるものも二度とチェックしたくないならここで add
                     seen_urls.add(url)
                     new_seen = True
                     continue
