@@ -15,17 +15,27 @@ from playwright.sync_api import sync_playwright, Page
 SOURCES_FILE = Path("config/sources.json")
 SEEN_URLS_FILE = Path("data/seen_urls.json")
 
-# RSS-Bridge インスタンス
-RSS_BRIDGE_BASE = "https://rss-bridge.org/bridge01/"
+# 🔹 使う RSS-Bridge インスタンスをできるだけたくさん用意しておく
+#  上から順に試して、ダメなら次へフェイルオーバーする
+RSS_BRIDGE_BASES = [
+    "https://rss-bridge.org/bridge01/",
+    "https://rss-bridge.bb8.fun/",
+    "https://ololbu.ru/rss-bridge/",
+    "https://tools.bheil.net/rss-bridge/",
+    "https://bridge.suumitsu.eu/",
+    "https://rss-bridge.ggc-project.de/",
+    "https://rssbridge.projectsegfau.lt/",
+    "https://rss.bloat.cat/",
+]
 
-# Google Sheets 設定
-GOOGLE_SHEET_NAME = "gofile_links"  # ←あなたのシート名に合わせて
-GOOGLE_SHEET_WORKSHEET = "シート1"   # ←タブ名に合わせて
+# Google Sheets 設定（★自分のシート名に合わせて）
+GOOGLE_SHEET_NAME = "gofile_links"  # スプレッドシートの名前
+GOOGLE_SHEET_WORKSHEET = "シート1"   # タブ名
 
 # gofile の URLパターン
 GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
 
-# gofile が死んでいるときに body に含まれるパターン
+# gofile が死んでいるときの文言
 GOFILE_DEAD_PATTERNS = [
     "This content does not exist",
     "The content you are looking for could not be found",
@@ -33,7 +43,7 @@ GOFILE_DEAD_PATTERNS = [
     "This content is password protected",
 ]
 
-# gofile 側にブロックされたっぽいときに出るパターン
+# gofile 側でブロックされてそうなときに出る文言
 GOFILE_BLOCK_PATTERN = "refreshAppdataAccountsAndSync getAccountActive Failed to fetch"
 
 # 1回の Run でチェックする gofile の最大件数
@@ -71,17 +81,19 @@ def save_seen_urls(seen: Set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
-def nitter_url_to_rss_url(nitter_url: str) -> str:
-    """Nitter URL を RSS-Bridge detect アクションのURLに変換"""
+def build_rss_url(base: str, nitter_url: str) -> str:
+    """Nitter の URL を、指定した RSS-Bridge インスタンスの detect アクション URL に変換"""
     encoded = quote_plus(nitter_url)
-    return f"{RSS_BRIDGE_BASE}?action=detect&format=Atom&url={encoded}"
+    # base は末尾が / の想定（上のリストは全部そうしてある）
+    return f"{base}?action=detect&format=Atom&url={encoded}"
 
 
 def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
-    """Nitter → RSS-Bridge → RSS から gofile を抜き出す"""
-    rss_url = nitter_url_to_rss_url(nitter_url)
+    """
+    Nitter → (複数の RSS-Bridge を順番に試す) → RSS から gofile を抜き出す
+    どれか1つのインスタンスからでも取れたら OK とする
+    """
     print(f"  Nitter URL: {nitter_url}")
-    print(f"  RSS-Bridge detect URL: {rss_url}")
 
     headers = {
         "User-Agent": (
@@ -91,17 +103,32 @@ def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
         )
     }
 
-    try:
-        resp = requests.get(rss_url, headers=headers, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  Failed to fetch RSS via RSS-Bridge: {e}")
-        return set()
+    last_error = None
 
-    text = resp.text
-    urls = set(GOFILE_REGEX.findall(text))
-    print(f"  Found {len(urls)} gofile URLs in feed (via RSS-Bridge)")
-    return urls
+    for base in RSS_BRIDGE_BASES:
+        rss_url = build_rss_url(base, nitter_url)
+        print(f"  Trying RSS-Bridge: {base} -> {rss_url}")
+
+        try:
+            resp = requests.get(rss_url, headers=headers, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"    Failed on {base}: {e}")
+            last_error = e
+            # このインスタンスはダメだったので、次のインスタンスを試す
+            continue
+
+        text = resp.text
+        urls = set(GOFILE_REGEX.findall(text))
+        print(f"    Success on {base}: found {len(urls)} gofile URLs in feed (via RSS-Bridge)")
+        return urls
+
+    # どのインスタンスでもダメだった場合
+    if last_error:
+        print(f"  All RSS-Bridge instances failed for this source. Last error: {last_error}")
+    else:
+        print("  All RSS-Bridge instances failed for this source (unknown error).")
+    return set()
 
 
 def check_gofile_status(page: Page, url: str) -> str:
