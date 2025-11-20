@@ -2,6 +2,7 @@ import json
 import re
 from pathlib import Path
 from typing import List, Set
+from urllib.parse import quote_plus
 
 import requests
 from playwright.sync_api import sync_playwright, Page
@@ -9,6 +10,10 @@ from playwright.sync_api import sync_playwright, Page
 # 設定ファイル
 SOURCES_FILE = Path("config/sources.json")
 SEEN_URLS_FILE = Path("data/seen_urls.json")
+
+# 使う RSS-Bridge インスタンス
+# 必要に応じて他の公開インスタンスに変えてOK
+RSS_BRIDGE_BASE = "https://rss-bridge.org/bridge01/"
 
 # gofile の URLパターン
 GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
@@ -25,12 +30,12 @@ OREVIDEO_URL = "https://orevideo.pythonanywhere.com/"
 
 
 def load_sources() -> List[str]:
-    """スクレイピング対象の RSS URL を config/sources.json から読み込み"""
+    """スクレイピング対象の Nitter URL を config/sources.json から読み込み"""
     if not SOURCES_FILE.exists():
-        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。RSSのURLをここに保存してください。")
+        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。NitterのURLをここに保存してください。")
     with SOURCES_FILE.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    # 形式: { "sources": ["https://...rss...", ...] }
+    # 形式: { "sources": ["https://nitter.net/...", ...] }
     return data.get("sources", [])
 
 
@@ -56,22 +61,45 @@ def save_seen_urls(seen: Set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
-def collect_gofile_urls_from_rss(rss_url: str) -> Set[str]:
+def nitter_url_to_rss_url(nitter_url: str) -> str:
     """
-    RSSフィードを取得して、中に含まれる gofile.io/d/... URL を全部抜き出す
-    （XMLの中身をそのままテキストとして正規表現で舐める）
+    Nitter の URL を RSS-Bridge の detect アクションに渡すためのURLに変換
+    detect は ?url= に対して適切な bridge を選んで RSS を返してくれる
+    https://rss-bridge.github.io/rss-bridge/For_Developers/Actions.html#detect
     """
-    print(f"  Fetching RSS: {rss_url}")
+    encoded = quote_plus(nitter_url)
+    return f"{RSS_BRIDGE_BASE}?action=detect&format=Atom&url={encoded}"
+
+
+def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
+    """
+    Nitter の URL を RSS-Bridge 経由で RSS にして、
+    そのフィードの中から gofile.io/d/... URL を全部抜き出す
+    """
+    rss_url = nitter_url_to_rss_url(nitter_url)
+    print(f"  Nitter URL: {nitter_url}")
+    print(f"  RSS-Bridge detect URL: {rss_url}")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+
     try:
-        resp = requests.get(rss_url, timeout=30)
+        resp = requests.get(rss_url, headers=headers, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        print(f"  Failed to fetch RSS: {e}")
+        print(f"  Failed to fetch RSS via RSS-Bridge: {e}")
         return set()
 
+    # detect アクションは 301 で display にリダイレクトする仕様なので、
+    # requests は自動で追いかけて Atom/XML を返してくれるはず。
     text = resp.text
     urls = set(GOFILE_REGEX.findall(text))
-    print(f"  Found {len(urls)} gofile URLs in RSS")
+    print(f"  Found {len(urls)} gofile URLs in feed (via RSS-Bridge)")
     return urls
 
 
@@ -120,10 +148,8 @@ def main():
     print(f"Loaded {len(seen_urls)} seen URLs")
 
     with sync_playwright() as p:
-        # headless Chromium を起動
+        # headless Chromium を起動（gofile / orevideo 用）
         browser = p.chromium.launch(headless=True)
-
-        # UA は一応それっぽいのを入れておく（gofile / orevideo用）
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -140,19 +166,18 @@ def main():
         new_seen = False
 
         for src in sources:
-            print(f"Scraping RSS source: {src}")
-            urls = collect_gofile_urls_from_rss(src)
+            print(f"Scraping source (Nitter): {src}")
+            urls = collect_gofile_urls_from_nitter_via_rss_bridge(src)
 
             for url in sorted(urls):
                 if url in seen_urls:
                     # すでに処理済み
-                    # print(f"  Already seen: {url}")
                     continue
 
                 print(f"  Checking gofile URL: {url}")
                 if not is_gofile_alive(gofile_page, url):
                     print("    -> Dead or password protected. Skipped.")
-                    # 死んでいるものも二度とチェックしたくないならここで add
+                    # 死んでいるものも再チェックしたくないならここで add
                     seen_urls.add(url)
                     new_seen = True
                     continue
