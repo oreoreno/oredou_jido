@@ -15,12 +15,12 @@ from playwright.sync_api import sync_playwright, Page
 SOURCES_FILE = Path("config/sources.json")
 SEEN_URLS_FILE = Path("data/seen_urls.json")
 
-# 使う RSS-Bridge インスタンス
+# RSS-Bridge インスタンス
 RSS_BRIDGE_BASE = "https://rss-bridge.org/bridge01/"
 
-# Google Sheets 設定（★ここを自分のシートに合わせて変えてください）
-GOOGLE_SHEET_NAME = "gofile_links"  # スプレッドシートの「名前」
-GOOGLE_SHEET_WORKSHEET = "シート1"   # ワークシート名（デフォルトは「シート1」）
+# Google Sheets 設定
+GOOGLE_SHEET_NAME = "gofile_links"  # ←あなたのシート名に合わせて
+GOOGLE_SHEET_WORKSHEET = "シート1"   # ←タブ名に合わせて
 
 # gofile の URLパターン
 GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
@@ -33,11 +33,17 @@ GOFILE_DEAD_PATTERNS = [
     "This content is password protected",
 ]
 
+# gofile 側にブロックされたっぽいときに出るパターン
+GOFILE_BLOCK_PATTERN = "refreshAppdataAccountsAndSync getAccountActive Failed to fetch"
+
+# 1回の Run でチェックする gofile の最大件数
+MAX_GOFILE_CHECKS_PER_RUN = 40
+
 
 def load_sources() -> List[str]:
     """スクレイピング対象の Nitter URL を config/sources.json から読み込み"""
     if not SOURCES_FILE.exists():
-        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。NitterのURLをここに保存してください。")
+        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。Nitter の URL をここに保存してください。")
     with SOURCES_FILE.open("r", encoding="utf-8") as f:
         data = json.load(f)
     return data.get("sources", [])
@@ -98,25 +104,41 @@ def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
     return urls
 
 
-def is_gofile_alive(page: Page, url: str) -> bool:
-    """gofile.io のリンクが生きているか判定"""
+def check_gofile_status(page: Page, url: str) -> str:
+    """
+    gofile.io のリンク状態を判定する
+
+    戻り値:
+      "alive"   : 生きている
+      "dead"    : 死亡 or パス付きなど
+      "blocked" : IP ブロックっぽい挙動を検出
+    """
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
-    except Exception:
-        return False
+    except Exception as e:
+        print(f"    -> Error loading page: {e}")
+        return "dead"
 
+    # JS が落ち着くまで少し待つ
     page.wait_for_timeout(3000)
 
     try:
         text = page.inner_text("body")
-    except Exception:
-        return False
+    except Exception as e:
+        print(f"    -> Error reading body text: {e}")
+        return "dead"
 
+    # ブロックっぽい挙動の検出（最優先）
+    if GOFILE_BLOCK_PATTERN in text:
+        print("    -> Detected block pattern on gofile page!")
+        return "blocked"
+
+    # 通常の死活判定
     for pattern in GOFILE_DEAD_PATTERNS:
         if pattern in text:
-            return False
+            return "dead"
 
-    return True
+    return "alive"
 
 
 # --- Google Sheets 関連 ---
@@ -171,22 +193,42 @@ def main():
 
         new_seen = False
         processed = 0
+        checks_done = 0
+        blocked_detected = False
 
         for src in sources:
             print(f"Scraping source (Nitter): {src}")
             urls = collect_gofile_urls_from_nitter_via_rss_bridge(src)
 
             for url in sorted(urls):
+                # すでに処理済みなら飛ばす
                 if url in seen_urls:
                     continue
 
+                # 一回の Run でのチェック上限
+                if checks_done >= MAX_GOFILE_CHECKS_PER_RUN:
+                    print(f"Reached max checks per run ({MAX_GOFILE_CHECKS_PER_RUN}). Stopping checks for this run.")
+                    blocked_detected = False  # これは単なる上限なのでブロック扱いではない
+                    break
+
                 print(f"  Checking gofile URL: {url}")
-                if not is_gofile_alive(gofile_page, url):
+                status = check_gofile_status(gofile_page, url)
+                checks_done += 1
+
+                if status == "blocked":
+                    print("    -> Looks like gofile blocked us. Stopping this run immediately to be safe.")
+                    blocked_detected = True
+                    # このURLは seen にも入れず、次回以降に再チャレンジできるようにする
+                    break
+
+                if status == "dead":
                     print("    -> Dead or password protected. Skipped.")
+                    # 死んでいるものも再チェックしたくないなら seen に入れる
                     seen_urls.add(url)
                     new_seen = True
                     continue
 
+                # status == "alive"
                 print("    -> Alive. Appending to Google Sheet...")
                 try:
                     append_row_to_sheet(gc, url, src)
@@ -197,12 +239,20 @@ def main():
                 except Exception as e:
                     print(f"    -> Append failed: {e}")
 
+            # 内側のループから抜ける理由が「ブロック検出」 or 「上限到達」の場合、
+            # 外側のループも抜けて今回の Run を終了する
+            if blocked_detected or checks_done >= MAX_GOFILE_CHECKS_PER_RUN:
+                break
+
         browser.close()
 
     if new_seen:
         save_seen_urls(seen_urls)
         print(f"Saved {len(seen_urls)} seen URLs")
     print(f"Processed {processed} new URLs in this run.")
+    print(f"Total gofile checks in this run: {checks_done}")
+    if blocked_detected:
+        print("Run ended early because a gofile block pattern was detected.")
 
 
 if __name__ == "__main__":
