@@ -3,8 +3,12 @@ import re
 from pathlib import Path
 from typing import List, Set
 from urllib.parse import quote_plus
+from datetime import datetime
+import os
 
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, Page
 
 # 設定ファイル
@@ -14,21 +18,20 @@ SEEN_URLS_FILE = Path("data/seen_urls.json")
 # 使う RSS-Bridge インスタンス
 RSS_BRIDGE_BASE = "https://rss-bridge.org/bridge01/"
 
-# 1回の実行で処理する最大件数（新規URLのみカウント）
-MAX_URLS_PER_RUN = 60  # ★ここで調整可能
+# Google Sheets 設定（★ここを自分のシートに合わせて変えてください）
+GOOGLE_SHEET_NAME = "gofile_links"  # スプレッドシートの「名前」
+GOOGLE_SHEET_WORKSHEET = "シート1"   # ワークシート名（デフォルトは「シート1」）
 
 # gofile の URLパターン
 GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
 
-# ページ内テキストにこのどれかが含まれていたらリンク切れとみなす
+# gofile が死んでいるときに body に含まれるパターン
 GOFILE_DEAD_PATTERNS = [
     "This content does not exist",
     "The content you are looking for could not be found",
     "No items to display",
     "This content is password protected",
 ]
-
-OREVIDEO_URL = "https://orevideo.pythonanywhere.com/"
 
 
 def load_sources() -> List[str]:
@@ -37,7 +40,6 @@ def load_sources() -> List[str]:
         raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。NitterのURLをここに保存してください。")
     with SOURCES_FILE.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    # 形式: { "sources": ["https://nitter.net/...", ...] }
     return data.get("sources", [])
 
 
@@ -64,19 +66,13 @@ def save_seen_urls(seen: Set[str]) -> None:
 
 
 def nitter_url_to_rss_url(nitter_url: str) -> str:
-    """
-    Nitter の URL を RSS-Bridge の detect アクションに渡すためのURLに変換
-    detect は ?url= に対して適切な bridge を選んで RSS を返してくれる
-    """
+    """Nitter URL を RSS-Bridge detect アクションのURLに変換"""
     encoded = quote_plus(nitter_url)
     return f"{RSS_BRIDGE_BASE}?action=detect&format=Atom&url={encoded}"
 
 
 def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
-    """
-    Nitter の URL を RSS-Bridge 経由で RSS にして、
-    そのフィードの中から gofile.io/d/... URL を全部抜き出す
-    """
+    """Nitter → RSS-Bridge → RSS から gofile を抜き出す"""
     rss_url = nitter_url_to_rss_url(nitter_url)
     print(f"  Nitter URL: {nitter_url}")
     print(f"  RSS-Bridge detect URL: {rss_url}")
@@ -107,10 +103,8 @@ def is_gofile_alive(page: Page, url: str) -> bool:
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
     except Exception:
-        # タイムアウトやネットワークエラーは一旦「生きてない」とみなす
         return False
 
-    # JSが落ち着くまで少し待つ
     page.wait_for_timeout(3000)
 
     try:
@@ -125,19 +119,32 @@ def is_gofile_alive(page: Page, url: str) -> bool:
     return True
 
 
-def upload_to_orevideo(page: Page, gofile_url: str) -> None:
-    """orevideo.pythonanywhere.com に対してURLを送信"""
-    page.goto(OREVIDEO_URL, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(2000)
+# --- Google Sheets 関連 ---
 
-    # input#url に値を入れる
-    page.fill("input#url", gofile_url)
+def get_gspread_client():
+    """環境変数 GOOGLE_SERVICE_ACCOUNT_JSON から gspread クライアントを生成"""
+    raw_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw_json:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON が環境変数に設定されていません。")
+    info = json.loads(raw_json)
 
-    # ボタン押下
-    page.click("#submitBtn")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc
 
-    # 処理待ち（必要に応じて延長）
-    page.wait_for_timeout(5000)
+
+def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str) -> None:
+    """Googleスプレッドシートに1行追記"""
+    sh = gc.open(GOOGLE_SHEET_NAME)
+    ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
+
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    row = [now, gofile_url, source_nitter_url]
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
 
 def main():
@@ -146,8 +153,10 @@ def main():
 
     print(f"Loaded {len(seen_urls)} seen URLs")
 
+    # Google Sheets クライアント作成
+    gc = get_gspread_client()
+
     with sync_playwright() as p:
-        # headless Chromium を起動（gofile / orevideo 用）
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=(
@@ -158,59 +167,42 @@ def main():
             viewport={"width": 1280, "height": 720},
         )
 
-        # gofile確認 & orevideoアップロード用ページ
         gofile_page = context.new_page()
-        ore_page = context.new_page()
 
         new_seen = False
-        processed_count = 0  # ★今回のrunで新規に処理したURL数
+        processed = 0
 
         for src in sources:
-            # 上限に達したら外側のループも抜ける
-            if processed_count >= MAX_URLS_PER_RUN:
-                print(f"Reached per-run limit of {MAX_URLS_PER_RUN} URLs. Stopping.")
-                break
-
             print(f"Scraping source (Nitter): {src}")
             urls = collect_gofile_urls_from_nitter_via_rss_bridge(src)
 
             for url in sorted(urls):
                 if url in seen_urls:
-                    # すでに処理済み（alive/死んでる問わず）
                     continue
-
-                if processed_count >= MAX_URLS_PER_RUN:
-                    print(f"Reached per-run limit of {MAX_URLS_PER_RUN} URLs. Stopping.")
-                    break
 
                 print(f"  Checking gofile URL: {url}")
                 if not is_gofile_alive(gofile_page, url):
                     print("    -> Dead or password protected. Skipped.")
-                    # 死んでいるものも再チェック不要ならここで追加
                     seen_urls.add(url)
                     new_seen = True
-                    processed_count += 1  # ★「新規1件」としてカウント
                     continue
 
-                print("    -> Alive. Uploading to orevideo...")
+                print("    -> Alive. Appending to Google Sheet...")
                 try:
-                    upload_to_orevideo(ore_page, url)
-                    print("    -> Upload done.")
+                    append_row_to_sheet(gc, url, src)
+                    print("    -> Append done.")
                     seen_urls.add(url)
                     new_seen = True
-                    processed_count += 1  # ★アップロード成功分もカウント
+                    processed += 1
                 except Exception as e:
-                    print(f"    -> Upload failed: {e}")
-                    # 通信エラーなどで seen に入れない場合はカウントしない
+                    print(f"    -> Append failed: {e}")
 
         browser.close()
 
     if new_seen:
         save_seen_urls(seen_urls)
         print(f"Saved {len(seen_urls)} seen URLs")
-        print(f"Processed {processed_count} new URLs in this run.")
-    else:
-        print("No new URLs processed.")
+    print(f"Processed {processed} new URLs in this run.")
 
 
 if __name__ == "__main__":
