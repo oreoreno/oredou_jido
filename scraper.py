@@ -1,0 +1,176 @@
+import json
+import os
+import re
+from pathlib import Path
+from typing import List, Set
+
+from playwright.sync_api import sync_playwright, Page
+
+# 設定ファイル
+SOURCES_FILE = Path("config/sources.json")
+SEEN_URLS_FILE = Path("data/seen_urls.json")
+
+GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
+# ページ内テキストにこのどれかが含まれていたらリンク切れとみなす
+GOFILE_DEAD_PATTERNS = [
+    "This content does not exist",
+    "The content you are looking for could not be found",
+    "No items to display",
+    "This content is password protected",
+]
+
+OREVIDEO_URL = "https://orevideo.pythonanywhere.com/"
+
+
+def load_sources() -> List[str]:
+    if not SOURCES_FILE.exists():
+        raise FileNotFoundError(f"{SOURCES_FILE} が存在しません。NitterのURLをここに保存してください。")
+    with SOURCES_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    # 形式: { "sources": ["https://nitter.net/...", ...] }
+    return data.get("sources", [])
+
+
+def load_seen_urls() -> Set[str]:
+    if not SEEN_URLS_FILE.exists():
+        SEEN_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SEEN_URLS_FILE.open("w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+        return set()
+    with SEEN_URLS_FILE.open("r", encoding="utf-8") as f:
+        try:
+            urls = json.load(f)
+            return set(urls)
+        except json.JSONDecodeError:
+            return set()
+
+
+def save_seen_urls(seen: Set[str]) -> None:
+    SEEN_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with SEEN_URLS_FILE.open("w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
+
+
+def scroll_and_collect_gofile_urls(page: Page) -> Set[str]:
+    """Nitterページで 'Load more' を押しつつ、gofile.io/d/... URL をすべて収集"""
+    urls: Set[str] = set()
+
+    while True:
+        # ツイート一覧から HTML を取って正規表現で抽出
+        html = page.content()
+        urls.update(GOFILE_REGEX.findall(html))
+
+        # Load more ボタンを探す
+        load_more = page.locator("div.show-more a:has-text('Load more')")
+        if load_more.count() == 0:
+            break
+
+        try:
+            load_more.first.click()
+            # 読み込み待ち（適宜調整）
+            page.wait_for_timeout(2000)
+        except Exception:
+            break
+
+    return urls
+
+
+def is_gofile_alive(page: Page, url: str) -> bool:
+    """gofile.io のリンクが生きているか判定"""
+    try:
+        page.goto(url, wait_until="networkidle", timeout=30000)
+    except Exception:
+        # タイムアウトやネットワークエラーは一旦「生きてない」とみなす
+        return False
+
+    # JSが落ち着くまで少し待つ
+    page.wait_for_timeout(3000)
+
+    text = page.inner_text("body")
+
+    for pattern in GOFILE_DEAD_PATTERNS:
+        if pattern in text:
+            return False
+
+    return True
+
+
+def upload_to_orevideo(page: Page, gofile_url: str) -> None:
+    """orevideo.pythonanywhere.com に対してURLを送信"""
+    page.goto(OREVIDEO_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(2000)
+
+    # input#url に値を入れる
+    page.fill("input#url", gofile_url)
+
+    # ボタン押下
+    page.click("#submitBtn")
+
+    # 処理待ち（必要に応じて延長）
+    page.wait_for_timeout(5000)
+
+
+def main():
+    sources = load_sources()
+    seen_urls = load_seen_urls()
+
+    print(f"Loaded {len(seen_urls)} seen URLs")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+
+        # Nitterスクレイピング用ページ
+        nitter_page = context.new_page()
+        # gofile確認 & orevideoアップロード用ページ
+        gofile_page = context.new_page()
+        ore_page = gofile_page  # 同じタブを使い回す
+
+        new_seen = False
+
+        for src in sources:
+            print(f"Scraping source: {src}")
+            try:
+                nitter_page.goto(src, wait_until="networkidle", timeout=30000)
+            except Exception as e:
+                print(f"Failed to open {src}: {e}")
+                continue
+
+            # 最新ツイート順でレンダリングされている前提
+            nitter_page.wait_for_timeout(3000)
+
+            urls = scroll_and_collect_gofile_urls(nitter_page)
+            print(f"  Found {len(urls)} gofile URLs")
+
+            for url in sorted(urls):  # 一応ソート（安定性のため）
+                if url in seen_urls:
+                    # すでに処理済み
+                    continue
+
+                print(f"  Checking gofile URL: {url}")
+                if not is_gofile_alive(gofile_page, url):
+                    print("    -> Dead or password protected. Skipped.")
+                    seen_urls.add(url)  # 死んでるものも記録しておいて再チェックしないようにする場合はここで追加
+                    new_seen = True
+                    continue
+
+                print("    -> Alive. Uploading to orevideo...")
+                try:
+                    upload_to_orevideo(ore_page, url)
+                    print("    -> Upload done.")
+                    seen_urls.add(url)
+                    new_seen = True
+                except Exception as e:
+                    print(f"    -> Upload failed: {e}")
+
+        browser.close()
+
+    if new_seen:
+        save_seen_urls(seen_urls)
+        print(f"Saved {len(seen_urls)} seen URLs")
+    else:
+        print("No new URLs processed.")
+
+
+if __name__ == "__main__":
+    main()
