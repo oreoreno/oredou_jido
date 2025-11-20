@@ -168,8 +168,18 @@ def main():
     print(f"Loaded {len(seen_urls)} seen URLs")
 
     with sync_playwright() as p:
+        # headless Chromium を起動
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+
+        # 👉 User-Agent を普通のChromeブラウザっぽく偽装
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 720},
+        )
 
         # Nitterスクレイピング用ページ
         nitter_page = context.new_page()
@@ -187,8 +197,16 @@ def main():
                 print(f"  Failed to open {src}: {e}")
                 continue
 
-            # 最新ツイート順でレンダリングされている前提
-            nitter_page.wait_for_timeout(3000)
+            # 最終URLとHTMLの一部をデバッグ出力
+            print(f"  Final URL: {nitter_page.url}")
+            nitter_page.wait_for_timeout(2000)
+
+            try:
+                html = nitter_page.content()
+                snippet = html[:600].replace("\n", " ")
+                print(f"  Page HTML snippet: {snippet}")
+            except Exception as e:
+                print(f"  Failed to get page content: {e}")
 
             urls = scroll_and_collect_gofile_urls(nitter_page)
             print(f"  Found {len(urls)} gofile URLs")
@@ -196,7 +214,6 @@ def main():
             for url in sorted(urls):  # 一応ソート（安定性のため）
                 if url in seen_urls:
                     # すでに処理済み
-                    # print(f"  Already seen: {url}")
                     continue
 
                 print(f"  Checking gofile URL: {url}")
