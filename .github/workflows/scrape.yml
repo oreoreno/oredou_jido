@@ -1,17 +1,16 @@
-name: Scrape Nitter and upload to orevideo
+name: Scrape Nitter and save to Google Sheets
 
 on:
   schedule:
-    # 30分ごとに実行
     - cron: "*/30 * * * *"
-  workflow_dispatch: {}  # 手動実行もできるように
+  workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write  # seen_urls.json を更新してコミットする場合に必要
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -25,14 +24,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright requests   # ★← ここに requests を追加
+          pip install playwright requests gspread google-auth
           playwright install --with-deps chromium
 
       - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           python scraper.py
 
-      # 収集済みURLの更新をリポジトリにコミットしたい場合
       - name: Commit updated seen_urls.json
         run: |
           if [[ `git status --porcelain` ]]; then
