@@ -24,7 +24,7 @@ SEEN_URLS_FILE = Path("data/seen_urls.json")
 # ------------------------------------------
 NITTER_MIRRORS = [
     "https://nitter.poast.org",
-    "https://nitter.cz", 
+    "https://nitter.cz",
     "https://nitter.rawbit.ninja",
     "https://nitter.esmailelbob.xyz",
     "https://nitter.d420.de",
@@ -41,7 +41,7 @@ NITTER_MIRRORS = [
 ]
 
 # ------------------------------------------
-#  RSS-Bridge ミラーローテーション
+#  RSS-Bridge ミラー
 # ------------------------------------------
 RSS_BRIDGE_MIRRORS = [
     "https://rss-bridge.org/bridge01/",
@@ -77,8 +77,9 @@ GOFILE_BLOCK_PATTERN = (
 # 1回の Run でチェックする最大 gofile 件数
 MAX_GOFILE_CHECKS_PER_RUN = 40
 
-# Nitter ロードモア上限
+# Nitter の Load more 上限
 MAX_NITTER_PAGES = 50
+
 
 # ------------------------------------------
 #  共通ユーティリティ
@@ -103,7 +104,7 @@ def load_seen_urls() -> Set[str]:
 
     try:
         return set(json.loads(SEEN_URLS_FILE.read_text(encoding="utf-8")))
-    except:
+    except json.JSONDecodeError:
         return set()
 
 
@@ -112,8 +113,10 @@ def save_seen_urls(urls: Set[str]):
     SEEN_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with SEEN_URLS_FILE.open("w", encoding="utf-8") as f:
         json.dump(sorted(urls), f, ensure_ascii=False, indent=2)
-        # ------------------------------------------
-#  Nitter ミラーからアカウント抽出
+
+
+# ------------------------------------------
+#  Nitter URL からアカウント抽出
 # ------------------------------------------
 
 def extract_account_from_nitter_url(nitter_url: str) -> Optional[str]:
@@ -141,7 +144,7 @@ def build_rss_url(base: str, nitter_url: str) -> str:
 
 
 def collect_gofile_via_rss_bridge(nitter_url: str) -> Set[str]:
-    """RSS-Bridge の全ミラーを順番に試し、成功したものだけ採用"""
+    """RSS-Bridge のミラーを順番に試し、成功した1つから gofile を抽出"""
     print(f"  [RSS] Source: {nitter_url}")
 
     headers = {
@@ -170,10 +173,14 @@ def collect_gofile_via_rss_bridge(nitter_url: str) -> Set[str]:
 
 
 # ------------------------------------------
-#  Nitter ミラーを1つずつ順番に試して検索を実行
+#  Nitter ミラーで検索 → gofile 抽出
 # ------------------------------------------
 
 def build_search_url(mirror: str, nitter_url: str) -> str:
+    """
+    - アカウントURLなら: @username で検索
+    - /search?... の場合: gofile.io/d/ で全体検索
+    """
     account = extract_account_from_nitter_url(nitter_url)
 
     if account:
@@ -187,47 +194,58 @@ def build_search_url(mirror: str, nitter_url: str) -> str:
 def collect_gofile_via_nitter(page: Page, nitter_url: str) -> Set[str]:
     """
     Nitter ミラーを1個ずつ試す。
-    どこか1個でも動いたら、そのミラーで Load More 全部実行して回収。
+    どこか1個でも動いたら、そのミラーで Load more を MAX_NITTER_PAGES 回まで押して回収。
     """
     print(f"  [NITTER] Source: {nitter_url}")
 
     for mirror in NITTER_MIRRORS:
         search_url = build_search_url(mirror, nitter_url)
         print(f"    [NITTER] Try mirror: {mirror}")
+        print(f"      URL: {search_url}")
 
         try:
             page.goto(search_url, wait_until="networkidle", timeout=30000)
-        except:
-            print("      -> mirror dead")
+        except Exception as e:
+            print(f"      -> mirror dead ({e})")
             continue
 
         time.sleep(2)
 
-        html = page.content()
-        found = set(GOFILE_REGEX.findall(html))
-        print(f"      Page1: {len(found)} URLs")
+        found: Set[str] = set()
 
-        # Load More を MAX_NITTER_PAGES 回繰り返す
-        for i in range(MAX_NITTER_PAGES):
+        # 1ページ目
+        html = page.content()
+        found |= set(GOFILE_REGEX.findall(html))
+        print(f"      Page 1: {len(found)} URLs")
+
+        # Load More を MAX_NITTER_PAGES 回まで繰り返す
+        for i in range(2, MAX_NITTER_PAGES + 1):
             load_btn = page.locator("a:has-text('Load more')")
             if load_btn.count() == 0:
+                print("      -> no more 'Load more' button, stop.")
                 break
 
             try:
                 load_btn.first.click()
                 time.sleep(2)
-            except:
+            except Exception as e:
+                print(f"      -> failed to click Load more: {e}")
                 break
 
             html = page.content()
-            found |= set(GOFILE_REGEX.findall(html))
+            new_urls = set(GOFILE_REGEX.findall(html))
+            before = len(found)
+            found |= new_urls
+            print(f"      Page {i}: total {len(found)} URLs (added {len(found) - before})")
 
         print(f"      -> mirror success, collected total {len(found)} URLs")
         return found
 
     print("    [NITTER] All mirrors failed.")
     return set()
-    # ------------------------------------------
+
+
+# ------------------------------------------
 # gofile 死活 & ブロック判定
 # ------------------------------------------
 
@@ -243,23 +261,27 @@ def check_gofile_status(page: Page, url: str) -> str:
 
     try:
         page.goto(url, wait_until="networkidle", timeout=25000)
-    except:
+    except Exception as e:
+        print(f"    [GOFILE] load error: {e}")
         return "dead"
 
     page.wait_for_timeout(2000)
 
     try:
         body = page.inner_text("body")
-    except:
+    except Exception as e:
+        print(f"    [GOFILE] body read error: {e}")
         return "dead"
 
     # ブロック判定
-    if "refreshAppdataAccountsAndSync getAccountActive Failed to fetch" in body:
+    if GOFILE_BLOCK_PATTERN in body:
+        print("    [GOFILE] Block pattern detected")
         return "blocked"
 
     # 死亡判定
     for pattern in GOFILE_DEAD_PATTERNS:
         if pattern in body:
+            print(f"    [GOFILE] Dead pattern detected: {pattern}")
             return "dead"
 
     return "alive"
@@ -286,19 +308,18 @@ def get_gspread_client():
 def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str):
     """
     必ず A=timestamp / B=gofile URL / C=元Nitter URL の順に書く
-    シートの最後尾に追記する
     """
-
     sh = gc.open(GOOGLE_SHEET_NAME)
     ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
 
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     row = [now, gofile_url, source_nitter_url]
 
-    # A〜C 列のみ固定
     ws.append_row(row, value_input_option="USER_ENTERED")
-    # ------------------------------------------
-# メイン処理（ミラー順次ローテーション）
+
+
+# ------------------------------------------
+# メイン処理
 # ------------------------------------------
 
 def main():
@@ -319,44 +340,30 @@ def main():
             viewport={"width": 1280, "height": 720},
         )
 
-        page_rss = context.new_page()
-        page_poast = context.new_page()
-        page_gofile = context.new_page()
+        nitter_page = context.new_page()
+        gofile_page = context.new_page()
 
         processed = 0
         checks_done = 0
         blocked_detected = False
         new_seen = False
 
-        # -------------------------
-        # 1. 各ソースを順番に処理
-        # -------------------------
         for src in sources:
             print(f"\nScraping source: {src}")
 
+            # 1) RSS-Bridge 経由
+            rss_urls = collect_gofile_via_rss_bridge(src)
+
+            # 2) Nitter ミラー経由
+            nitter_urls = collect_gofile_via_nitter(nitter_page, src)
+
             collected: Set[str] = set()
+            collected |= rss_urls
+            collected |= nitter_urls
 
-            # A. ミラー1個ずつ試す
-            for mirror in NITTER_MIRRORS:
-                print(f"  Trying mirror: {mirror}")
+            print(f"  Total collected URLs (RSS + Nitter): {len(collected)}")
 
-                urls = collect_from_single_mirror(
-                    page_poast, mirror, src
-                )
-
-                print(f"    -> collected {len(urls)} from {mirror}")
-
-                collected |= urls
-
-                # ミラー1個成功したら break する（次のアカウントへ）
-                if len(urls) > 0:
-                    break
-
-            print(f"  Total collected from all mirrors: {len(collected)}")
-
-            # -------------------------
-            # 2. gofile 状態チェック
-            # -------------------------
+            # 3) gofile の生死チェック & シート書き込み
             for url in sorted(collected):
 
                 if url in seen_urls:
@@ -368,7 +375,7 @@ def main():
                     break
 
                 print(f"  Checking gofile: {url}")
-                status = check_gofile_status(page_gofile, url)
+                status = check_gofile_status(gofile_page, url)
                 checks_done += 1
 
                 if status == "blocked":
@@ -383,19 +390,19 @@ def main():
                     continue
 
                 print("  -> alive, writing to sheet...")
-                append_row_to_sheet(gc, url, src)
-                processed += 1
-                seen_urls.add(url)
-                new_seen = True
+                try:
+                    append_row_to_sheet(gc, url, src)
+                    processed += 1
+                    seen_urls.add(url)
+                    new_seen = True
+                except Exception as e:
+                    print(f"  -> append failed: {e}")
 
             if blocked_detected or checks_done >= MAX_GOFILE_CHECKS_PER_RUN:
                 break
 
         browser.close()
 
-    # -------------------------
-    # 結果保存
-    # -------------------------
     if new_seen:
         save_seen_urls(seen_urls)
 
@@ -403,3 +410,8 @@ def main():
     print(f"Total gofile checks in this run: {checks_done}")
     if blocked_detected:
         print("Run ended early due to block detection.")
+
+
+# ここが無いせいで今まで何も動いてませんでした
+if __name__ == "__main__":
+    main()
