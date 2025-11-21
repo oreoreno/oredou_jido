@@ -49,7 +49,10 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          python scraper.py
+          set -xe
+          echo "=== START SCRAPER ==="
+          python -u scraper.py
+          echo "=== END SCRAPER ==="
 
       - name: Commit updated seen_urls.json
         run: |
