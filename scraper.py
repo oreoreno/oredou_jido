@@ -189,6 +189,11 @@ def collect_gofile_urls_from_nitter_direct(page: Page, nitter_url: str) -> Set[s
     - プロフィールURLの場合: @ユーザー名で検索
     - /search?... の場合: gofile.io/d/ で全体検索
     - Load more を MAX_NITTER_PAGES 回までクリックして、過去分も回収
+
+    ★変更点★
+      DOM セレクタではなく、page.content() で取得した HTML 全体から
+      GOFILE_REGEX で gofile URL を抜き出すようにした。
+      これにより、タグ構造が a から span 等に変わっても取得できる。
     """
     search_url = build_poast_search_url(nitter_url)
     print(f"  [POAST] Search URL: {search_url}")
@@ -204,17 +209,14 @@ def collect_gofile_urls_from_nitter_direct(page: Page, nitter_url: str) -> Set[s
     page.wait_for_timeout(3000)
 
     for page_index in range(MAX_NITTER_PAGES):
-        # gofile リンクを全部拾う
+        # ページ全体の HTML を取得して正規表現で gofile を抜く
         try:
-            locator = page.locator("a[href^='https://gofile.io/d/']")
-            count = locator.count()
-            print(f"    [POAST] Page {page_index+1}: found {count} gofile <a> elements")
-            for i in range(count):
-                href = locator.nth(i).get_attribute("href")
-                if href:
-                    urls.add(href)
+            html = page.content()
+            found = set(GOFILE_REGEX.findall(html))
+            print(f"    [POAST] Page {page_index+1}: found {len(found)} gofile URLs (via regex in HTML)")
+            urls |= found
         except Exception as e:
-            print(f"    [POAST] Error while scanning page: {e}")
+            print(f"    [POAST] Error while scanning page HTML: {e}")
             break
 
         # Load more を探してクリック
