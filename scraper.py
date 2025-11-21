@@ -1,8 +1,8 @@
 import json
 import re
 from pathlib import Path
-from typing import List, Set
-from urllib.parse import quote_plus
+from typing import List, Set, Optional
+from urllib.parse import quote_plus, urlparse
 from datetime import datetime
 import os
 
@@ -11,28 +11,33 @@ import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, Page
 
-# 設定ファイル
+# -------------------------
+# 設定ファイル / 定数
+# -------------------------
+
 SOURCES_FILE = Path("config/sources.json")
 SEEN_URLS_FILE = Path("data/seen_urls.json")
 
-# 🔹 使う RSS-Bridge インスタンスをできるだけたくさん用意しておく
-#  上から順に試して、ダメなら次へフェイルオーバーする
+# 使う RSS-Bridge インスタンス（上から順に試す）
 RSS_BRIDGE_BASES = [
     "https://rss-bridge.org/bridge01/",
     "https://rss-bridge.bb8.fun/",
     "https://ololbu.ru/rss-bridge/",
     "https://tools.bheil.net/rss-bridge/",
     "https://bridge.suumitsu.eu/",
-    "https://rss-bridge.ggc-project.de/",
-    "https://rssbridge.projectsegfau.lt/",
-    "https://rss.bloat.cat/",
 ]
 
-# Google Sheets 設定（★自分のシート名に合わせて）
-GOOGLE_SHEET_NAME = "gofile_links"  # スプレッドシートの名前
-GOOGLE_SHEET_WORKSHEET = "シート1"   # タブ名
+# poast の Nitter ベースURL
+NITTER_POAST_BASE = "https://nitter.poast.org"
 
-# gofile の URLパターン
+# Nitter 検索で「Load more」をクリックする最大回数
+MAX_NITTER_PAGES = 3  # ここを増やせばもっと深くまで回収できる
+
+# Google Sheets 設定（★ここは自分のシート名に合わせて）
+GOOGLE_SHEET_NAME = "gofile_links"
+GOOGLE_SHEET_WORKSHEET = "シート1"
+
+# gofile URL パターン
 GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
 
 # gofile が死んでいるときの文言
@@ -49,6 +54,10 @@ GOFILE_BLOCK_PATTERN = "refreshAppdataAccountsAndSync getAccountActive Failed to
 # 1回の Run でチェックする gofile の最大件数
 MAX_GOFILE_CHECKS_PER_RUN = 40
 
+
+# -------------------------
+# 共通ユーティリティ
+# -------------------------
 
 def load_sources() -> List[str]:
     """スクレイピング対象の Nitter URL を config/sources.json から読み込み"""
@@ -81,10 +90,13 @@ def save_seen_urls(seen: Set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
+# -------------------------
+# RSS-Bridge 経由
+# -------------------------
+
 def build_rss_url(base: str, nitter_url: str) -> str:
     """Nitter の URL を、指定した RSS-Bridge インスタンスの detect アクション URL に変換"""
     encoded = quote_plus(nitter_url)
-    # base は末尾が / の想定（上のリストは全部そうしてある）
     return f"{base}?action=detect&format=Atom&url={encoded}"
 
 
@@ -93,7 +105,7 @@ def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
     Nitter → (複数の RSS-Bridge を順番に試す) → RSS から gofile を抜き出す
     どれか1つのインスタンスからでも取れたら OK とする
     """
-    print(f"  Nitter URL: {nitter_url}")
+    print(f"  [RSS] Nitter URL: {nitter_url}")
 
     headers = {
         "User-Agent": (
@@ -107,29 +119,127 @@ def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
 
     for base in RSS_BRIDGE_BASES:
         rss_url = build_rss_url(base, nitter_url)
-        print(f"  Trying RSS-Bridge: {base} -> {rss_url}")
+        print(f"  [RSS] Trying RSS-Bridge: {base} -> {rss_url}")
 
         try:
             resp = requests.get(rss_url, headers=headers, timeout=30)
             resp.raise_for_status()
         except Exception as e:
-            print(f"    Failed on {base}: {e}")
+            print(f"    [RSS] Failed on {base}: {e}")
             last_error = e
-            # このインスタンスはダメだったので、次のインスタンスを試す
             continue
 
         text = resp.text
         urls = set(GOFILE_REGEX.findall(text))
-        print(f"    Success on {base}: found {len(urls)} gofile URLs in feed (via RSS-Bridge)")
+        print(f"    [RSS] Success on {base}: found {len(urls)} gofile URLs in feed")
         return urls
 
-    # どのインスタンスでもダメだった場合
     if last_error:
-        print(f"  All RSS-Bridge instances failed for this source. Last error: {last_error}")
+        print(f"  [RSS] All RSS-Bridge instances failed for this source. Last error: {last_error}")
     else:
-        print("  All RSS-Bridge instances failed for this source (unknown error).")
+        print("  [RSS] All RSS-Bridge instances failed for this source (unknown error).")
     return set()
 
+
+# -------------------------
+# Nitter(poast) 直接スクレイピング
+# -------------------------
+
+def extract_account_from_nitter_url(nitter_url: str) -> Optional[str]:
+    """
+    https://nitter.net/tyui33601530 → tyui33601530
+    https://nitter.net/search?f=tweets&q=... → None
+    """
+    parsed = urlparse(nitter_url)
+    segments = [s for s in parsed.path.split("/") if s]
+    if not segments:
+        return None
+    if segments[0].lower() == "search":
+        return None
+    # 先頭セグメントをアカウントIDとみなす
+    return segments[0]
+
+
+def build_poast_search_url(nitter_url: str) -> str:
+    """
+    poast 用の検索URLを作る。
+    - アカウントURLなら: q="@account"
+    - /search?... の場合は: q="gofile.io/d/" （全体検索）
+    """
+    parsed = urlparse(nitter_url)
+    segments = [s for s in parsed.path.split("/") if s]
+
+    # /search?... の場合は gofile.io/d/ で全体検索
+    if segments and segments[0].lower() == "search":
+        query = "gofile.io/d/"
+    else:
+        # プロフィールURLなら @ユーザー名 で検索
+        account = extract_account_from_nitter_url(nitter_url)
+        if account:
+            query = f"@{account}"
+        else:
+            # 念のため fallback
+            query = "gofile.io/d/"
+
+    q_param = quote_plus(query)
+    search_url = f"{NITTER_POAST_BASE}/search?f=tweets&q={q_param}&since=&until=&near="
+    return search_url
+
+
+def collect_gofile_urls_from_nitter_direct(page: Page, nitter_url: str) -> Set[str]:
+    """
+    Playwright で nitter.poast.org の Search を開いて、
+    ページ内にある https://gofile.io/d/... を拾う。
+    - プロフィールURLの場合: @ユーザー名で検索
+    - /search?... の場合: gofile.io/d/ で全体検索
+    - Load more を MAX_NITTER_PAGES 回までクリックして、過去分も回収
+    """
+    search_url = build_poast_search_url(nitter_url)
+    print(f"  [POAST] Search URL: {search_url}")
+
+    urls: Set[str] = set()
+
+    try:
+        page.goto(search_url, wait_until="networkidle", timeout=30000)
+    except Exception as e:
+        print(f"    [POAST] Failed to load search page: {e}")
+        return urls
+
+    page.wait_for_timeout(3000)
+
+    for page_index in range(MAX_NITTER_PAGES):
+        # gofile リンクを全部拾う
+        try:
+            locator = page.locator("a[href^='https://gofile.io/d/']")
+            count = locator.count()
+            print(f"    [POAST] Page {page_index+1}: found {count} gofile <a> elements")
+            for i in range(count):
+                href = locator.nth(i).get_attribute("href")
+                if href:
+                    urls.add(href)
+        except Exception as e:
+            print(f"    [POAST] Error while scanning page: {e}")
+            break
+
+        # Load more を探してクリック
+        try:
+            load_more = page.locator("div.show-more a, a:has-text('Load more')")
+            if load_more.count() == 0:
+                print("    [POAST] No more 'Load more' button. Stop pagination.")
+                break
+            print("    [POAST] Clicking 'Load more'...")
+            load_more.first.click()
+            page.wait_for_timeout(3000)
+        except Exception:
+            print("    [POAST] Failed to click 'Load more' or no more pages.")
+            break
+
+    return urls
+
+
+# -------------------------
+# gofile 死活 & ブロック判定
+# -------------------------
 
 def check_gofile_status(page: Page, url: str) -> str:
     """
@@ -146,7 +256,6 @@ def check_gofile_status(page: Page, url: str) -> str:
         print(f"    -> Error loading page: {e}")
         return "dead"
 
-    # JS が落ち着くまで少し待つ
     page.wait_for_timeout(3000)
 
     try:
@@ -155,12 +264,10 @@ def check_gofile_status(page: Page, url: str) -> str:
         print(f"    -> Error reading body text: {e}")
         return "dead"
 
-    # ブロックっぽい挙動の検出（最優先）
     if GOFILE_BLOCK_PATTERN in text:
         print("    -> Detected block pattern on gofile page!")
         return "blocked"
 
-    # 通常の死活判定
     for pattern in GOFILE_DEAD_PATTERNS:
         if pattern in text:
             return "dead"
@@ -168,7 +275,9 @@ def check_gofile_status(page: Page, url: str) -> str:
     return "alive"
 
 
-# --- Google Sheets 関連 ---
+# -------------------------
+# Google Sheets 関連
+# -------------------------
 
 def get_gspread_client():
     """環境変数 GOOGLE_SERVICE_ACCOUNT_JSON から gspread クライアントを生成"""
@@ -196,13 +305,16 @@ def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str) -> None:
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
+# -------------------------
+# メイン処理
+# -------------------------
+
 def main():
     sources = load_sources()
     seen_urls = load_seen_urls()
 
     print(f"Loaded {len(seen_urls)} seen URLs")
 
-    # Google Sheets クライアント作成
     gc = get_gspread_client()
 
     with sync_playwright() as p:
@@ -217,6 +329,7 @@ def main():
         )
 
         gofile_page = context.new_page()
+        nitter_page = context.new_page()
 
         new_seen = False
         processed = 0
@@ -225,17 +338,27 @@ def main():
 
         for src in sources:
             print(f"Scraping source (Nitter): {src}")
-            urls = collect_gofile_urls_from_nitter_via_rss_bridge(src)
+
+            # ① RSS-Bridge 経由で gofile を集める
+            rss_urls = collect_gofile_urls_from_nitter_via_rss_bridge(src)
+
+            # ② nitter.poast.org の Search 経由で gofile を集める
+            direct_urls = collect_gofile_urls_from_nitter_direct(nitter_page, src)
+
+            # ③ 合体（set なので自動で重複除去）
+            urls = set()
+            urls |= rss_urls
+            urls |= direct_urls
+
+            print(f"  -> Total collected URLs for this source: {len(urls)}")
 
             for url in sorted(urls):
-                # すでに処理済みなら飛ばす
                 if url in seen_urls:
                     continue
 
-                # 一回の Run でのチェック上限
                 if checks_done >= MAX_GOFILE_CHECKS_PER_RUN:
                     print(f"Reached max checks per run ({MAX_GOFILE_CHECKS_PER_RUN}). Stopping checks for this run.")
-                    blocked_detected = False  # これは単なる上限なのでブロック扱いではない
+                    blocked_detected = False
                     break
 
                 print(f"  Checking gofile URL: {url}")
@@ -245,17 +368,14 @@ def main():
                 if status == "blocked":
                     print("    -> Looks like gofile blocked us. Stopping this run immediately to be safe.")
                     blocked_detected = True
-                    # このURLは seen にも入れず、次回以降に再チャレンジできるようにする
                     break
 
                 if status == "dead":
                     print("    -> Dead or password protected. Skipped.")
-                    # 死んでいるものも再チェックしたくないなら seen に入れる
                     seen_urls.add(url)
                     new_seen = True
                     continue
 
-                # status == "alive"
                 print("    -> Alive. Appending to Google Sheet...")
                 try:
                     append_row_to_sheet(gc, url, src)
@@ -266,8 +386,6 @@ def main():
                 except Exception as e:
                     print(f"    -> Append failed: {e}")
 
-            # 内側のループから抜ける理由が「ブロック検出」 or 「上限到達」の場合、
-            # 外側のループも抜けて今回の Run を終了する
             if blocked_detected or checks_done >= MAX_GOFILE_CHECKS_PER_RUN:
                 break
 
