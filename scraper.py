@@ -29,7 +29,7 @@ NITTER_POAST_BASE = "https://nitter.poast.org"
 # Nitter 検索で「Load more」をクリックする最大回数
 MAX_NITTER_PAGES = 6  # ここを増やせばもっと深くまで回収できる
 
-# Google Sheets 設定（★ここは自分のシート名に合わせて）
+# Google Sheets 設定
 GOOGLE_SHEET_NAME = "gofile_links"
 GOOGLE_SHEET_WORKSHEET = "シート1"
 
@@ -98,7 +98,7 @@ def build_rss_url(base: str, nitter_url: str) -> str:
 
 def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
     """
-    Nitter → (複数の RSS-Bridge を順番に試す) → RSS から gofile を抜き出す
+    Nitter → RSS-Bridge → RSS から gofile を抜き出す
     どれか1つのインスタンスからでも取れたら OK とする
     """
     print(f"  [RSS] Nitter URL: {nitter_url}")
@@ -292,13 +292,24 @@ def get_gspread_client():
 
 
 def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str) -> None:
-    """Googleスプレッドシートに1行追記"""
+    """Googleスプレッドシートに1行追記（必ず A〜C 列に固定）"""
     sh = gc.open(GOOGLE_SHEET_NAME)
     ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
 
+    # 現在のシートの行数（ヘッダー行も含む）
+    current_values = ws.get_all_values()
+    next_row = len(current_values) + 1  # 次に書く行番号
+
+    # A列: timestamp, B列: gofile URL, C列: 元のNitter URL
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    row = [now, gofile_url, source_nitter_url]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    row_values = [now, gofile_url, source_nitter_url]
+
+    # 必ず A〜C にだけ書く
+    ws.update(
+        f"A{next_row}:C{next_row}",
+        [row_values],
+        value_input_option="USER_ENTERED"
+    )
 
 
 # -------------------------
