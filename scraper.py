@@ -307,7 +307,8 @@ def get_gspread_client():
 
 def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str):
     """
-    必ず A=timestamp / B=gofile URL / C=元Nitter URL の順に書く
+    必ず A=timestamp / B=gofile URL / C=元Nitter URL の順に書く。
+    A〜C の範囲を明示して指定する。
     """
     sh = gc.open(GOOGLE_SHEET_NAME)
     ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
@@ -315,7 +316,19 @@ def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str):
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     row = [now, gofile_url, source_nitter_url]
 
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    # 送っている内容をログに出す（GitHub Actions のログで確認用）
+    print("[APPEND ROW]", row)
+
+    # 既存行数を数えて、次の行番号を決める
+    current_rows = len(ws.get_all_values())
+    next_row = current_rows + 1
+
+    # A〜C 列だけを更新
+    ws.update(
+        f"A{next_row}:C{next_row}",
+        [row],
+        value_input_option="USER_ENTERED",
+    )
 
 
 # ------------------------------------------
@@ -412,6 +425,5 @@ def main():
         print("Run ended early due to block detection.")
 
 
-# ここが無いせいで今まで何も動いてませんでした
 if __name__ == "__main__":
     main()
