@@ -21,10 +21,6 @@ SEEN_URLS_FILE = Path("data/seen_urls.json")
 # 使う RSS-Bridge インスタンス（上から順に試す）
 RSS_BRIDGE_BASES = [
     "https://rss-bridge.org/bridge01/",
-    "https://rss-bridge.bb8.fun/",
-    "https://ololbu.ru/rss-bridge/",
-    "https://tools.bheil.net/rss-bridge/",
-    "https://bridge.suumitsu.eu/",
 ]
 
 # poast の Nitter ベースURL
