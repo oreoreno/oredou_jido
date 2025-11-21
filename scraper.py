@@ -27,14 +27,18 @@ RSS_BRIDGE_BASES = [
 NITTER_POAST_BASE = "https://nitter.poast.org"
 
 # Nitter 検索で「Load more」をクリックする最大回数
-MAX_NITTER_PAGES = 50  # ここを増やせばもっと深くまで回収できる
+MAX_NITTER_PAGES = 50  # 深く回収したい場合はここで調整
 
 # Google Sheets 設定
 GOOGLE_SHEET_NAME = "gofile_links"
 GOOGLE_SHEET_WORKSHEET = "シート1"
 
 # gofile URL パターン
-GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
+#   - http/https あり・なし両方OK
+#   - パスは /d/<英数> 固定
+GOFILE_REGEX = re.compile(
+    r"(?:https?://)?gofile\.io/d/[0-9A-Za-z]+"
+)
 
 # gofile が死んでいるときの文言
 GOFILE_DEAD_PATTERNS = [
@@ -86,6 +90,28 @@ def save_seen_urls(seen: Set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
+def normalize_gofile_urls_from_text(text: str) -> Set[str]:
+    """
+    テキスト全体から gofile.io/d/... を抜き出して
+    すべて "https://gofile.io/d/..." 形式にそろえて返す。
+    JSON 由来の \"https:\/\/gofile.io\/d\/...\" にも対応するため
+    まず \\/ を / に置き換える。
+    """
+    # JSON などでエスケープされたスラッシュを普通のスラッシュに戻す
+    normalized_text = text.replace("\\/", "/")
+
+    raw_urls = set(GOFILE_REGEX.findall(normalized_text))
+    urls: Set[str] = set()
+
+    for u in raw_urls:
+        # GOFILE_REGEX は先頭にプロトコル無しも許しているので補正する
+        if not u.startswith("http"):
+            u = "https://" + u
+        urls.add(u)
+
+    return urls
+
+
 # -------------------------
 # RSS-Bridge 経由
 # -------------------------
@@ -125,8 +151,8 @@ def collect_gofile_urls_from_nitter_via_rss_bridge(nitter_url: str) -> Set[str]:
             last_error = e
             continue
 
-        text = resp.text
-        urls = set(GOFILE_REGEX.findall(text))
+        # ★ここも normalize_gofile_urls_from_text を使う
+        urls = normalize_gofile_urls_from_text(resp.text)
         print(f"    [RSS] Success on {base}: found {len(urls)} gofile URLs in feed")
         return urls
 
@@ -185,15 +211,10 @@ def build_poast_search_url(nitter_url: str) -> str:
 def collect_gofile_urls_from_nitter_direct(page: Page, nitter_url: str) -> Set[str]:
     """
     Playwright で nitter.poast.org の Search を開いて、
-    ページ内にある https://gofile.io/d/... を拾う。
+    ページ内にある gofile.io/d/... を拾う。
     - プロフィールURLの場合: @ユーザー名で検索
     - /search?... の場合: gofile.io/d/ で全体検索
     - Load more を MAX_NITTER_PAGES 回までクリックして、過去分も回収
-
-    ★変更点★
-      DOM セレクタではなく、page.content() で取得した HTML 全体から
-      GOFILE_REGEX で gofile URL を抜き出すようにした。
-      これにより、タグ構造が a から span 等に変わっても取得できる。
     """
     search_url = build_poast_search_url(nitter_url)
     print(f"  [POAST] Search URL: {search_url}")
@@ -209,10 +230,9 @@ def collect_gofile_urls_from_nitter_direct(page: Page, nitter_url: str) -> Set[s
     page.wait_for_timeout(3000)
 
     for page_index in range(MAX_NITTER_PAGES):
-        # ページ全体の HTML を取得して正規表現で gofile を抜く
         try:
             html = page.content()
-            found = set(GOFILE_REGEX.findall(html))
+            found = normalize_gofile_urls_from_text(html)
             print(f"    [POAST] Page {page_index+1}: found {len(found)} gofile URLs (via regex in HTML)")
             urls |= found
         except Exception as e:
@@ -306,7 +326,6 @@ def append_row_to_sheet(gc, gofile_url: str, source_nitter_url: str) -> None:
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     row_values = [now, gofile_url, source_nitter_url]
 
-    # 必ず A〜C にだけ書く
     ws.update(
         f"A{next_row}:C{next_row}",
         [row_values],
