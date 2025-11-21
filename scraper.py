@@ -27,7 +27,7 @@ RSS_BRIDGE_BASES = [
 NITTER_POAST_BASE = "https://nitter.poast.org"
 
 # Nitter 検索で「Load more」をクリックする最大回数
-MAX_NITTER_PAGES = 6  # ここを増やせばもっと深くまで回収できる
+MAX_NITTER_PAGES = 50  # ここを増やせばもっと深くまで回収できる
 
 # Google Sheets 設定
 GOOGLE_SHEET_NAME = "gofile_links"
