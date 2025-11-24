@@ -13,16 +13,15 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, Page
 
 # ------------------------------------------
-# 設定ファイル / 保存用ファイル
+#  設定ファイル / 保存用ファイル
 # ------------------------------------------
 
 SOURCES_FILE = Path("config/sources.json")
 SEEN_URLS_FILE = Path("data/seen_urls.json")
 
 # ------------------------------------------
-# Nitter ミラー
+#  Nitter ミラー（フォールバック順）
 # ------------------------------------------
-
 NITTER_MIRRORS = [
     "https://nitter.poast.org",
     "https://nitter.cz",
@@ -42,9 +41,8 @@ NITTER_MIRRORS = [
 ]
 
 # ------------------------------------------
-# RSS-Bridge ミラー
+#  RSS-Bridge ミラー
 # ------------------------------------------
-
 RSS_BRIDGE_MIRRORS = [
     "https://rss-bridge.org/bridge01/",
     "https://rss-bridge.org/bridge02/",
@@ -55,123 +53,88 @@ RSS_BRIDGE_MIRRORS = [
 ]
 
 # ------------------------------------------
-# Google Sheets 設定
+#  Google Sheets 設定
 # ------------------------------------------
-
 GOOGLE_SHEET_NAME = "gofile_links"
 GOOGLE_SHEET_WORKSHEET = "シート1"
 
 # ------------------------------------------
-# gofile 検索用
+#  gofile.io 判定
 # ------------------------------------------
-
 GOFILE_REGEX = re.compile(r"https://gofile\.io/d/[0-9A-Za-z]+")
-
 GOFILE_DEAD_PATTERNS = [
     "This content does not exist",
     "The content you are looking for could not be found",
     "No items to display",
     "This content is password protected",
 ]
-
-GOFILE_BLOCK_PATTERN = (
-    "refreshAppdataAccountsAndSync getAccountActive Failed to fetch"
-)
+GOFILE_BLOCK_PATTERN = "refreshAppdataAccountsAndSync getAccountActive Failed to fetch"
 
 MAX_GOFILE_CHECKS_PER_RUN = 40
-MAX_NITTER_PAGES = 50
-
+MAX_NITTER_PAGES = 60
 
 # ------------------------------------------
-#  ユーティリティ
+#  Utility
 # ------------------------------------------
 
 def load_sources() -> List[str]:
-    if not SOURCES_FILE.exists():
-        raise FileNotFoundError("config/sources.json がありません")
-    with SOURCES_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f).get("sources", [])
-
+    return json.loads(SOURCES_FILE.read_text())["sources"]
 
 def load_seen_urls() -> Set[str]:
     if not SEEN_URLS_FILE.exists():
-        SEEN_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SEEN_URLS_FILE.write_text("[]", encoding="utf-8")
         return set()
     try:
-        return set(json.loads(SEEN_URLS_FILE.read_text(encoding="utf-8")))
+        return set(json.loads(SEEN_URLS_FILE.read_text()))
     except:
         return set()
 
-
 def save_seen_urls(urls: Set[str]):
     SEEN_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with SEEN_URLS_FILE.open("w", encoding="utf-8") as f:
-        json.dump(sorted(urls), f, ensure_ascii=False, indent=2)
-
+    SEEN_URLS_FILE.write_text(json.dumps(sorted(urls), indent=2, ensure_ascii=False))
 
 def extract_account(url: str) -> Optional[str]:
-    parsed = urlparse(url)
-    segments = [s for s in parsed.path.split("/") if s]
-    if not segments:
-        return None
-    if segments[0].lower() == "search":
+    segments = [s for s in urlparse(url).path.split("/") if s]
+    if not segments or segments[0].lower() == "search":
         return None
     return segments[0]
 
-
 # ------------------------------------------
-# RSS-Bridge で抽出
+#  RSS Bridge
 # ------------------------------------------
 
-def build_rss_url(base: str, nitter_url: str) -> str:
-    return f"{base}?action=detect&format=Atom&url={quote_plus(nitter_url)}"
-
-
-def collect_via_rss_bridge(nitter_url: str) -> Set[str]:
-    print(f"  [RSS] {nitter_url}")
-    headers = {"User-Agent": "Mozilla/5.0"}
-
+def rss_collect(src: str) -> Set[str]:
+    print(f"  [RSS] {src}")
     for base in RSS_BRIDGE_MIRRORS:
         print(f"    Try: {base}")
+        encoded = quote_plus(src)
+        rss_url = f"{base}?action=detect&format=Atom&url={encoded}"
         try:
-            r = requests.get(build_rss_url(base, nitter_url), headers=headers, timeout=20)
+            r = requests.get(rss_url, timeout=20)
             r.raise_for_status()
+            found = set(GOFILE_REGEX.findall(r.text))
+            print(f"      Success → {len(found)} URLs")
+            return found
         except Exception as e:
             print(f"      Failed: {e}")
-            continue
-
-        urls = set(GOFILE_REGEX.findall(r.text))
-        print(f"      Success → {len(urls)} URLs")
-        return urls
-
     return set()
 
-
 # ------------------------------------------
-# Nitter (Playwright)
+#  Nitter
 # ------------------------------------------
 
-def build_search_url(mirror: str, nitter_url: str) -> str:
-    account = extract_account(nitter_url)
-    if account:
-        return f"{mirror}/{account}"  # /<user> へ直接
-    return f"{mirror}/search?f=tweets&q=gofile.io/d/"
-
-
-def collect_via_nitter(page: Page, nitter_url: str) -> Set[str]:
-    print(f"  [NITTER] {nitter_url}")
+def collect_nitter(page: Page, src: str) -> Set[str]:
+    print(f"  [NITTER] {src}")
+    account = extract_account(src)
 
     for mirror in NITTER_MIRRORS:
-        target = build_search_url(mirror, nitter_url)
+        search = f"@{account}" if account else "gofile.io/d/"
+        url = f"{mirror}/search?f=tweets&q={quote_plus(search)}"
         print(f"    Try mirror: {mirror}")
-        try:
-            page.goto(target, wait_until="domcontentloaded", timeout=30000)
-        except:
-            print("      mirror dead")
-            continue
 
-        time.sleep(2)
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30000)
+        except Exception:
+            continue
 
         found = set(GOFILE_REGEX.findall(page.content()))
         print(f"      Page1: {len(found)}")
@@ -183,62 +146,44 @@ def collect_via_nitter(page: Page, nitter_url: str) -> Set[str]:
             try:
                 btn.first.click()
                 time.sleep(2)
-            except:
+                found |= set(GOFILE_REGEX.findall(page.content()))
+            except Exception:
                 break
-            found |= set(GOFILE_REGEX.findall(page.content()))
 
         print(f"      success → total {len(found)} URLs")
         return found
-
-    print("    All Nitter mirrors failed.")
     return set()
 
-
 # ------------------------------------------
-# mobile.twitter (requests) ← NEW
+#  Mobile Twitter fallback
 # ------------------------------------------
 
-def collect_via_mobile(src: str) -> Set[str]:
+def collect_mobile(page: Page, src: str) -> Set[str]:
     account = extract_account(src)
     if not account:
         return set()
 
     url = f"https://mobile.twitter.com/{account}"
     print(f"  [MOBILE] {url}")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
     try:
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
+        page.goto(url, wait_until="networkidle", timeout=30000)
     except Exception as e:
-        print(f"    mobile request fail: {e}")
+        print(f"    [MOBILE] load error: {e}")
         return set()
 
-    urls = set(GOFILE_REGEX.findall(r.text))
-    print(f"    mobile success → {len(urls)} URLs")
-    return urls
-
+    return set(GOFILE_REGEX.findall(page.content()))
 
 # ------------------------------------------
-# gofile 状態確認
+#  gofile status
 # ------------------------------------------
 
-def check_gofile_status(page: Page, url: str) -> str:
+def check_gofile(page: Page, url: str) -> str:
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
-    except:
+        page.goto(url, wait_until="networkidle", timeout=25000)
+    except Exception:
         return "dead"
 
-    time.sleep(1)
-    try:
-        body = page.inner_text("body")
-    except:
-        return "dead"
-
+    body = page.inner_text("body")
     if GOFILE_BLOCK_PATTERN in body:
         return "blocked"
     for p in GOFILE_DEAD_PATTERNS:
@@ -246,103 +191,95 @@ def check_gofile_status(page: Page, url: str) -> str:
             return "dead"
     return "alive"
 
-
 # ------------------------------------------
-# Google Sheets
+#  Google Sheets append (列ズレ完全修正版)
 # ------------------------------------------
 
-def get_gspread_client():
+def get_sheet():
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    return gspread.authorize(Credentials.from_service_account_info(info, scopes=scopes))
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"],
+    )
+    return gspread.authorize(creds).open(GOOGLE_SHEET_NAME).worksheet(GOOGLE_SHEET_WORKSHEET)
 
-
-def append_row(gc, gofile_url: str, source_url: str):
-    sh = gc.open(GOOGLE_SHEET_NAME)
-    ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
-
+def append_row(gc_sheet, gofile, src):
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    row = [now, gofile_url, source_url]
+    row = [now, gofile, src]
 
+    values = gc_sheet.get_all_values()
+    next_row = len(values) + 1
+
+    cell_range = "A" + str(next_row) + ":C" + str(next_row)   # ← f-string禁止で安全
     print("[APPEND]", row)
 
-    current_rows = len(ws.get_all_values())
-    next_row = current_rows + 1
-
-    ws.update(f"A{next_row}:C{next_row}", [row], value_input_option="USER_ENTERED")
-
+    gc_sheet.update(cell_range, [row], value_input_option="USER_ENTERED")
 
 # ------------------------------------------
-# Main
+#  Main
 # ------------------------------------------
 
 def main():
     sources = load_sources()
     seen = load_seen_urls()
-    gc = get_gspread_client()
+
+    sheet = get_sheet()
 
     processed = 0
     checks = 0
-    blocked = False
-    new_seen_added = False
+    new_seen = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            user_agent="Mozilla/5.0",
-            viewport={"width": 1280, "height": 720},
-        )
-        page_nitter = ctx.new_page()
-        page_gofile = ctx.new_page()
+        ctx = browser.new_context(user_agent="Mozilla/5.0 Chrome/123")
+        page_n = ctx.new_page()
+        page_g = ctx.new_page()
+        page_m = ctx.new_page()
 
         for src in sources:
             print(f"\n=== Scraping: {src}")
 
-            urls = set()
-            urls |= collect_via_rss_bridge(src)
-            urls |= collect_via_nitter(page_nitter, src)
-            urls |= collect_via_mobile(src)
+            collected = set()
+            collected |= rss_collect(src)
+            collected |= collect_nitter(page_n, src)
+            collected |= collect_mobile(page_m, src)
 
-            print(f"  total collected: {len(urls)}")
+            print(f"  total collected: {len(collected)}")
 
-            for url in sorted(urls):
+            for url in sorted(collected):
                 if url in seen:
                     continue
-
                 if checks >= MAX_GOFILE_CHECKS_PER_RUN:
-                    blocked = False
-                    break
+                    browser.close()
+                    save_seen_urls(seen)
+                    print(f"Processed {processed} URLs | gofile checks: {checks}")
+                    return
 
-                status = check_gofile_status(page_gofile, url)
+                stat = check_gofile(page_g, url)
                 checks += 1
 
-                if status == "blocked":
-                    blocked = True
-                    break
-                if status == "dead":
+                if stat == "blocked":
+                    print("⚠️ gofile blocked — ending run")
+                    browser.close()
+                    save_seen_urls(seen)
+                    return
+                if stat == "dead":
                     seen.add(url)
-                    new_seen_added = True
+                    new_seen = True
                     continue
 
-                append_row(gc, url, src)
+                append_row(sheet, url, src)
                 processed += 1
                 seen.add(url)
-                new_seen_added = True
-
-            if blocked or checks >= MAX_GOFILE_CHECKS_PER_RUN:
-                break
+                new_seen = True
 
         browser.close()
 
-    if new_seen_added:
+    if new_seen:
         save_seen_urls(seen)
 
     print(f"Processed {processed} URLs | gofile checks: {checks}")
-    if blocked:
-        print("⚠️ blocked by gofile — run ended early")
 
 
 if __name__ == "__main__":
